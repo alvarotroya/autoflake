@@ -710,7 +710,10 @@ def is_literal_or_name(value):
     return re.match(r'^\w+\s*$', value)
 
 
-def useless_pass_line_numbers(source):
+def useless_pass_line_numbers(
+    source,
+    ignore_pass_after_docstring=False,
+):
     """Yield line numbers of unneeded "pass" statements."""
     sio = io.StringIO(source)
     previous_token_type = None
@@ -735,22 +738,45 @@ def useless_pass_line_numbers(source):
             last_pass_row = start_row
             last_pass_indentation = get_indentation(line)
 
-        # Trailing "pass".
-        if (is_pass and
-                previous_token_type != tokenize.INDENT and
-                not previous_line.rstrip().endswith('\\')):
-            yield start_row
+            is_trailing_pass = (
+                previous_token_type != tokenize.INDENT
+                and not previous_line.rstrip().endswith("\\")
+            )
+
+            is_pass_after_docstring = (
+                previous_token_type == tokenize.NEWLINE
+                and previous_line.rstrip().endswith('"""')
+            )
+
+            # Trailing "pass".
+            if is_trailing_pass:
+                if ignore_pass_after_docstring and is_pass_after_docstring:
+                    pass
+                else:
+                    yield start_row
 
         previous_token_type = token_type
         previous_line = line
 
 
-def filter_useless_pass(source):
+def filter_useless_pass(
+    source,
+    ignore_pass_statements=False,
+    ignore_pass_after_docstring=False,
+):
     """Yield code with useless "pass" lines removed."""
-    try:
-        marked_lines = frozenset(useless_pass_line_numbers(source))
-    except (SyntaxError, tokenize.TokenError):
+    if ignore_pass_statements:
         marked_lines = frozenset()
+    else:
+        try:
+            marked_lines = frozenset(
+                useless_pass_line_numbers(
+                    source,
+                    ignore_pass_after_docstring,
+                )
+            )
+        except (SyntaxError, tokenize.TokenError):
+            marked_lines = frozenset()
 
     sio = io.StringIO(source)
     for line_number, line in enumerate(sio.readlines(), start=1):
@@ -776,9 +802,17 @@ def get_line_ending(line):
         return line[non_whitespace_index:]
 
 
-def fix_code(source, additional_imports=None, expand_star_imports=False,
-             remove_all_unused_imports=False, remove_duplicate_keys=False,
-             remove_unused_variables=False, ignore_init_module_imports=False):
+def fix_code(
+    source,
+    additional_imports=None,
+    expand_star_imports=False,
+    remove_all_unused_imports=False,
+    remove_duplicate_keys=False,
+    remove_unused_variables=False,
+    ignore_init_module_imports=False,
+    ignore_pass_statements=False,
+    ignore_pass_after_docstring=False,
+):
     """Return code with all filtering run on it."""
     if not source:
         return source
@@ -789,17 +823,23 @@ def fix_code(source, additional_imports=None, expand_star_imports=False,
 
     filtered_source = None
     while True:
-        filtered_source = ''.join(
-            filter_useless_pass(''.join(
-                filter_code(
-                    source,
-                    additional_imports=additional_imports,
-                    expand_star_imports=expand_star_imports,
-                    remove_all_unused_imports=remove_all_unused_imports,
-                    remove_duplicate_keys=remove_duplicate_keys,
-                    remove_unused_variables=remove_unused_variables,
-                    ignore_init_module_imports=ignore_init_module_imports,
-                ))))
+        filtered_source = "".join(
+            filter_useless_pass(
+                "".join(
+                    filter_code(
+                        source,
+                        additional_imports=additional_imports,
+                        expand_star_imports=expand_star_imports,
+                        remove_all_unused_imports=remove_all_unused_imports,
+                        remove_duplicate_keys=remove_duplicate_keys,
+                        remove_unused_variables=remove_unused_variables,
+                        ignore_init_module_imports=ignore_init_module_imports,
+                    )
+                ),
+                ignore_pass_statements=ignore_pass_statements,
+                ignore_pass_after_docstring=ignore_pass_after_docstring,
+            )
+        )
 
         if filtered_source == source:
             break
@@ -831,6 +871,8 @@ def fix_file(filename, args, standard_out):
         remove_duplicate_keys=args.remove_duplicate_keys,
         remove_unused_variables=args.remove_unused_variables,
         ignore_init_module_imports=ignore_init_module_imports,
+        ignore_pass_statements=args.ignore_pass_statements,
+        ignore_pass_after_docstring=args.ignore_pass_after_docstring,
     )
 
     if original_source != filtered_source:
@@ -992,42 +1034,86 @@ def _main(argv, standard_out, standard_error):
     0 means no error.
     """
     import argparse
-    parser = argparse.ArgumentParser(description=__doc__, prog='autoflake')
-    parser.add_argument('-c', '--check', action='store_true',
-                        help='return error code if changes are needed')
-    parser.add_argument('-i', '--in-place', action='store_true',
-                        help='make changes to files instead of printing diffs')
-    parser.add_argument('-r', '--recursive', action='store_true',
-                        help='drill down directories recursively')
-    parser.add_argument('--exclude', metavar='globs',
-                        help='exclude file/directory names that match these '
-                             'comma-separated globs')
-    parser.add_argument('--imports',
-                        help='by default, only unused standard library '
-                             'imports are removed; specify a comma-separated '
-                             'list of additional modules/packages')
-    parser.add_argument('--expand-star-imports', action='store_true',
-                        help='expand wildcard star imports with undefined '
-                             'names; this only triggers if there is only '
-                             'one star import in the file; this is skipped if '
-                             'there are any uses of `__all__` or `del` in the '
-                             'file')
-    parser.add_argument('--remove-all-unused-imports', action='store_true',
-                        help='remove all unused imports (not just those from '
-                             'the standard library)')
-    parser.add_argument('--ignore-init-module-imports', action='store_true',
-                        help='exclude __init__.py when removing unused '
-                             'imports')
-    parser.add_argument('--remove-duplicate-keys', action='store_true',
-                        help='remove all duplicate keys in objects')
-    parser.add_argument('--remove-unused-variables', action='store_true',
-                        help='remove unused variables')
-    parser.add_argument('--version', action='version',
-                        version='%(prog)s ' + __version__)
-    parser.add_argument('-v', '--verbose', action='count', dest='verbosity',
-                        default=0, help='print more verbose logs (you can '
-                                        'repeat `-v` to make it more verbose)')
-    parser.add_argument('files', nargs='+', help='files to format')
+
+    parser = argparse.ArgumentParser(description=__doc__, prog="autoflake")
+    parser.add_argument(
+        "-c",
+        "--check",
+        action="store_true",
+        help="return error code if changes are needed",
+    )
+    parser.add_argument(
+        "-i",
+        "--in-place",
+        action="store_true",
+        help="make changes to files instead of printing diffs",
+    )
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="drill down directories recursively",
+    )
+    parser.add_argument(
+        "--exclude",
+        metavar="globs",
+        help="exclude file/directory names that match these " "comma-separated globs",
+    )
+    parser.add_argument(
+        "--imports",
+        help="by default, only unused standard library "
+        "imports are removed; specify a comma-separated "
+        "list of additional modules/packages",
+    )
+    parser.add_argument(
+        "--expand-star-imports",
+        action="store_true",
+        help="expand wildcard star imports with undefined "
+        "names; this only triggers if there is only "
+        "one star import in the file; this is skipped if "
+        "there are any uses of `__all__` or `del` in the "
+        "file",
+    )
+    parser.add_argument(
+        "--remove-all-unused-imports",
+        action="store_true",
+        help="remove all unused imports (not just those from " "the standard library)",
+    )
+    parser.add_argument(
+        "--ignore-init-module-imports",
+        action="store_true",
+        help="exclude __init__.py when removing unused " "imports",
+    )
+    parser.add_argument(
+        "--ignore-pass-statements",
+        action="store_true",
+        help="ignore all pass statements",
+    )
+    parser.add_argument(
+        "--ignore-pass-after-docstring",
+        action="store_true",
+        help='ignore pass statements after a newline ending on \'"""\'',
+    )
+    parser.add_argument(
+        "--remove-duplicate-keys",
+        action="store_true",
+        help="remove all duplicate keys in objects",
+    )
+    parser.add_argument(
+        "--remove-unused-variables", action="store_true", help="remove unused variables"
+    )
+    parser.add_argument(
+        "--version", action="version", version="%(prog)s " + __version__
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        dest="verbosity",
+        default=0,
+        help="print more verbose logs (you can " "repeat `-v` to make it more verbose)",
+    )
+    parser.add_argument("files", nargs="+", help="files to format")
 
     args = parser.parse_args(argv[1:])
 
